@@ -1,0 +1,53 @@
+---
+title: |
+  \vspace*{\fill}
+  \fontsize{34}{38}\selectfont \textbf {Crime Reporting Analytics Database}
+author: |
+  \fontsize{24}{28}\selectfont Seif H. Kungulio
+date: |
+  \fontsize{18}{22}\selectfont March 23, 2026
+  \ \vspace*{\fill}
+description: "Building a star schema database for Crime Reporting Analytics Database"
+categories: [R, SQL, PostgreSQL, Database, Reporting]
+tags: [RMarkdown, PostgreSQL, Star Schema, Data Engineering, Reporting]
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+    toc_depth: 3
+    number_sections: true
+    highlight: espresso
+    include:
+      in_header: resources/header.tex
+header-includes:
+  - \usepackage{xcolor}
+  - \definecolor{brand}{HTML}{000000}
+  - \definecolor{subbrand}{HTML}{212121}
+  - \usepackage{titlesec}
+  - \titleformat{\section}{\Large\bfseries\color{brand}}{\thesection}{1em}{}
+  - \titleformat{\subsection}{\large\bfseries\color{subbrand}}{\thesubsection}{0.75em}{}
+  - \usepackage[most]{tcolorbox}
+  - \tcbset{colback=white, colframe=brand, coltitle=white, fonttitle=\bfseries}
+  - \usepackage{fancyhdr}
+  - \pagestyle{fancy}
+  - \fancyhead[L]{\textcolor{brand}{Crime Reporting Analytics Database}}
+  - \fancyhead[R]{\textcolor{subbrand}{Seif H. Kungulio}}
+  - \fancyfoot[C]{\thepage}
+editor_options:
+  chunk_output_type: console
+---
+
+\pagenumbering{gobble}
+
+\newpage
+\thispagestyle{plain}
+&nbsp;
+
+\newpage
+\pagenumbering{roman}
+\tableofcontents
+
+\newpage
+\pagenumbering{arabic}
+
+# Introduction
