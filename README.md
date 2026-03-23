@@ -1,1 +1,4 @@
-# crime_analytics_platform
+# Crime Analytics Platform
+### Data Warehouse, BI Dashboard & Machine Learning Forecasting
+---
+
