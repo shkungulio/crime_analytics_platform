@@ -1,0 +1,909 @@
+---
+title: "Crime Reporting Analytics Database"
+author: "Seif H. Kungulio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+# Introduction
+
+To support crime trend reporting, geographic hotspot analysis, offense pattern analysis, and executive dashboard development, the source NIBRS public files must be transformed into a structured analytical database. The project uses yearly files from 2020 through 2026 and standardizes them into a production-oriented PostgreSQL warehouse with a reporting-friendly star schema. This document is intentionally modeled after the uploaded Divvy example, which organizes the workflow into environment setup, database creation, normalization, dimensions, fact loading, indexing, views, exploratory SQL, and data quality maintenance. fileciteturn1file4
+
+The source files contain incident identifiers, occurrence dates and hours, NIBRS offense classifications and descriptions, offense counts, beat, premise, address components, city, ZIP code, and map coordinates. Across the yearly files, the column naming convention changes between 2020–2024 and 2025–2026, so the first design requirement is a standardization layer before dimensional modeling.
+
+This database is designed to:
+
+- consolidate the yearly source files into a single analytics-ready environment,
+- preserve a raw audit layer while exposing curated staging and dimensional marts,
+- support temporal, offense, geographic, and premise-based reporting,
+- enforce referential integrity with surrogate-key dimensions,
+- enable efficient Power BI reporting and downstream machine learning feature extraction.
+
+# Database Creation
+
+## Environment Setup
+
+This setup prepares the R environment for database work, file ingestion, and exploratory analysis. It follows the same pattern used in the Divvy example by installing packages, loading them, suppressing noise in the knitted output, and registering a shared database connection for subsequent SQL chunks. fileciteturn1file0
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(dplyr.print_min = 20, dplyr.print_max = 20)
+options(dplyr.summarise.inform = FALSE)
+
+required_pkgs <- c(
+  "DBI", "RPostgres", "readr", "dplyr", "stringr", "lubridate",
+  "purrr", "glue", "janitor", "ggplot2", "tidyr", "scales"
+)
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+```
+
+## Database Connection
+
+This section reads PostgreSQL connection details from an external `.ini` file and safely establishes the database session. The same connection is then registered for embedded SQL chunks, mirroring the connection strategy demonstrated in the Divvy document. fileciteturn1file0
+
+```{r connection}
+if (!requireNamespace("ini", quietly = TRUE)) install.packages("ini")
+library(ini)
+
+config <- read.ini("resources/db_config.ini")
+db <- config$postgresql
+
+con <- tryCatch({
+  DBI::dbConnect(
+    RPostgres::Postgres(),
+    host = db$host,
+    dbname = db$database,
+    user = db$user,
+    password = db$password,
+    port = as.integer(db$port)
+  )
+}, error = function(e) {
+  stop("Database connection failed: ", e$message)
+})
+
+knitr::opts_chunk$set(connection = con)
+```
+
+## Prerequisites
+
+These extensions support hashing, UUID generation, and indexing patterns useful for production analytics workloads. This mirrors the prerequisite-extension pattern used in the Divvy database example. fileciteturn1file1
+
+```{sql prerequisites, connection=con}
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS btree_gin;
+```
+
+## Source File Discovery
+
+This chunk discovers the yearly NIBRS source files and creates a small control table that will later be useful for reproducible loads and refresh tracking.
+
+```{r source-files}
+source_files <- tibble::tibble(
+  source_year = 2020:2026,
+  file_name = paste0("NIBRSPublicView", source_year, ".csv"),
+  file_path = paste0("resources/data/", file_name)
+)
+
+source_files
+```
+
+## Schema Strategy
+
+The warehouse is organized into four schemas:
+
+- `raw_crime`: one raw landing table per source year,
+- `stg_crime`: one standardized staging table for all years,
+- `mart_crime`: dimensional model for reporting and Power BI,
+- `qa_crime`: load audit and data quality artifacts.
+
+This expands the layered pattern seen in the Divvy example, which moved from staging tables to dimensions and fact tables. Here the approach is more production-ready because raw, staging, mart, and QA responsibilities are explicitly separated. fileciteturn1file2turn1file3
+
+```{sql schemas, connection=con}
+CREATE SCHEMA IF NOT EXISTS raw_crime;
+CREATE SCHEMA IF NOT EXISTS stg_crime;
+CREATE SCHEMA IF NOT EXISTS mart_crime;
+CREATE SCHEMA IF NOT EXISTS qa_crime;
+```
+
+## Raw Landing Tables
+
+Each yearly file lands in its own raw table to preserve source fidelity. The raw layer is intentionally permissive and keeps all values as text where practical so that source anomalies do not break ingestion.
+
+```{r raw-table-ddl}
+years <- 2020:2026
+
+for (yr in years) {
+  DBI::dbExecute(con, glue::glue("DROP TABLE IF EXISTS raw_crime.nibrs_{yr} CASCADE;"))
+  DBI::dbExecute(con, glue::glue("
+    CREATE TABLE raw_crime.nibrs_{yr} (
+      incident_text        TEXT,
+      occurrence_date_text TEXT,
+      occurrence_hour_text TEXT,
+      nibrs_class_text     TEXT,
+      nibrs_desc_text      TEXT,
+      offense_count_text   TEXT,
+      beat_text            TEXT,
+      premise_text         TEXT,
+      street_no_text       TEXT,
+      street_name_text     TEXT,
+      street_type_text     TEXT,
+      street_suffix_text   TEXT,
+      city_text            TEXT,
+      zip_code_text        TEXT,
+      longitude_text       TEXT,
+      latitude_text        TEXT,
+      source_file_year     INT,
+      source_file_name     TEXT,
+      load_ts              TIMESTAMP DEFAULT now()
+    );
+  "))
+}
+```
+
+## Load the Source CSVs
+
+This chunk reads each yearly file, standardizes the two source naming variants, and writes the data into the raw landing tables. The central idea is similar to the Divvy loading loop, but adapted to yearly crime files and inconsistent source headers. fileciteturn1file2
+
+```{r load-raw}
+rename_nibrs_cols <- function(df) {
+  nm <- names(df)
+  if ("RMSOccurrenceDate" %in% nm) {
+    df <- df %>%
+      dplyr::rename(
+        incident_text        = Incident,
+        occurrence_date_text = RMSOccurrenceDate,
+        occurrence_hour_text = RMSOccurrenceHour,
+        nibrs_class_text     = NIBRSClass,
+        nibrs_desc_text      = NIBRSDescription,
+        offense_count_text   = OffenseCount,
+        beat_text            = Beat,
+        premise_text         = Premise,
+        street_no_text       = StreetNo,
+        street_name_text     = StreetName,
+        street_type_text     = StreetType,
+        street_suffix_text   = Suffix,
+        city_text            = City,
+        zip_code_text        = ZIPCode,
+        longitude_text       = MapLongitude,
+        latitude_text        = MapLatitude
+      )
+  } else {
+    df <- df %>%
+      dplyr::rename(
+        incident_text        = Incident,
+        occurrence_date_text = `Occurrence Date`,
+        occurrence_hour_text = `Occurrence Hour`,
+        nibrs_class_text     = `NIBRS Class`,
+        nibrs_desc_text      = `NIBRS Description`,
+        offense_count_text   = `Offense Count`,
+        beat_text            = Beat,
+        premise_text         = Premise,
+        street_no_text       = `Street Number`,
+        street_name_text     = `Street Name`,
+        street_type_text     = `Street Type`,
+        street_suffix_text   = `Street Suffix`,
+        city_text            = City,
+        zip_code_text        = `ZIP Code`,
+        longitude_text       = `Map Longitude`,
+        latitude_text        = `Map Latitude`
+      )
+  }
+  df
+}
+
+for (yr in years) {
+  fp <- file.path("resources/data", paste0("NIBRSPublicView", yr, ".csv"))
+  message("Loading: ", fp)
+  df <- readr::read_csv(fp, show_col_types = FALSE) %>%
+    rename_nibrs_cols() %>%
+    dplyr::mutate(
+      source_file_year = yr,
+      source_file_name = basename(fp)
+    )
+
+  DBI::dbWriteTable(
+    con,
+    name = DBI::Id(schema = "raw_crime", table = paste0("nibrs_", yr)),
+    value = df,
+    append = TRUE,
+    row.names = FALSE
+  )
+}
+```
+
+## Standardized Staging Table
+
+The staging table converts raw text into typed analytics fields, standardizes beat and address values, derives temporal columns, and generates durable natural keys and row hashes for quality control and deduplication.
+
+```{sql staging-table, connection=con}
+DROP TABLE IF EXISTS stg_crime.stg_nibrs_offense CASCADE;
+
+CREATE TABLE stg_crime.stg_nibrs_offense (
+  stg_row_id           BIGSERIAL PRIMARY KEY,
+  incident_id          BIGINT,
+  occurrence_date      DATE,
+  occurrence_hour      SMALLINT,
+  occurrence_ts        TIMESTAMP,
+  nibrs_class          TEXT,
+  nibrs_description    TEXT,
+  offense_count        INTEGER,
+  beat_code            TEXT,
+  premise_desc         TEXT,
+  street_number        TEXT,
+  street_name          TEXT,
+  street_type          TEXT,
+  street_suffix        TEXT,
+  full_address         TEXT,
+  city_name            TEXT,
+  zip_code             TEXT,
+  map_longitude        DOUBLE PRECISION,
+  map_latitude         DOUBLE PRECISION,
+  source_year          INTEGER,
+  source_file_name     TEXT,
+  year_num             INTEGER,
+  quarter_num          INTEGER,
+  month_num            INTEGER,
+  week_num             INTEGER,
+  day_num              INTEGER,
+  day_of_week_num      INTEGER,
+  day_name             TEXT,
+  is_weekend           BOOLEAN,
+  hour_band            TEXT,
+  incident_nk          TEXT,
+  location_nk          TEXT,
+  row_hash             TEXT,
+  load_ts              TIMESTAMP DEFAULT now()
+);
+```
+
+```{r stage-load}
+DBI::dbExecute(con, "TRUNCATE TABLE stg_crime.stg_nibrs_offense;")
+
+for (yr in years) {
+  sql <- glue::glue("
+    INSERT INTO stg_crime.stg_nibrs_offense (
+      incident_id, occurrence_date, occurrence_hour, occurrence_ts,
+      nibrs_class, nibrs_description, offense_count, beat_code, premise_desc,
+      street_number, street_name, street_type, street_suffix, full_address,
+      city_name, zip_code, map_longitude, map_latitude,
+      source_year, source_file_name,
+      year_num, quarter_num, week_num, month_num, day_num,
+      day_of_week_num, day_name, is_weekend, hour_band,
+      incident_nk, location_nk, row_hash
+    )
+    SELECT
+      NULLIF(trim(incident_text), '')::BIGINT AS incident_id,
+      CASE
+        WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+        WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+        ELSE NULL
+      END AS occurrence_date,
+      NULLIF(trim(occurrence_hour_text), '')::SMALLINT AS occurrence_hour,
+      (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+        + make_interval(hours => COALESCE(NULLIF(trim(occurrence_hour_text), '')::INT, 0))
+      )::timestamp AS occurrence_ts,
+      NULLIF(trim(nibrs_class_text), '') AS nibrs_class,
+      NULLIF(trim(nibrs_desc_text), '') AS nibrs_description,
+      COALESCE(NULLIF(trim(offense_count_text), '')::INT, 1) AS offense_count,
+      NULLIF(regexp_replace(trim(beat_text), '^Beat\\s+', ''), '') AS beat_code,
+      NULLIF(trim(premise_text), '') AS premise_desc,
+      NULLIF(trim(street_no_text), '') AS street_number,
+      NULLIF(trim(street_name_text), '') AS street_name,
+      NULLIF(trim(street_type_text), '') AS street_type,
+      NULLIF(trim(street_suffix_text), '') AS street_suffix,
+      NULLIF(trim(concat_ws(' ', street_no_text, street_name_text, street_type_text, street_suffix_text)), '') AS full_address,
+      upper(NULLIF(trim(city_text), '')) AS city_name,
+      NULLIF(trim(zip_code_text), '') AS zip_code,
+      NULLIF(trim(longitude_text), '')::DOUBLE PRECISION AS map_longitude,
+      NULLIF(trim(latitude_text), '')::DOUBLE PRECISION AS map_latitude,
+      source_file_year AS source_year,
+      source_file_name,
+      EXTRACT(YEAR FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      ))::INT AS year_num,
+      EXTRACT(QUARTER FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      ))::INT AS quarter_num,
+      EXTRACT(WEEK FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      ))::INT AS week_num,
+      EXTRACT(MONTH FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      ))::INT AS month_num,
+      EXTRACT(DAY FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      ))::INT AS day_num,
+      EXTRACT(DOW FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      ))::INT AS day_of_week_num,
+      trim(to_char(
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END, 'Day')) AS day_name,
+      (EXTRACT(DOW FROM (
+        CASE
+          WHEN occurrence_date_text ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN occurrence_date_text::date
+          WHEN occurrence_date_text ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(occurrence_date_text, 'MM/DD/YYYY')
+          ELSE NULL
+        END
+      )) IN (0,6)) AS is_weekend,
+      CASE
+        WHEN COALESCE(NULLIF(trim(occurrence_hour_text), '')::INT, 0) BETWEEN 0 AND 5 THEN 'Overnight'
+        WHEN COALESCE(NULLIF(trim(occurrence_hour_text), '')::INT, 0) BETWEEN 6 AND 11 THEN 'Morning'
+        WHEN COALESCE(NULLIF(trim(occurrence_hour_text), '')::INT, 0) BETWEEN 12 AND 17 THEN 'Afternoon'
+        WHEN COALESCE(NULLIF(trim(occurrence_hour_text), '')::INT, 0) BETWEEN 18 AND 21 THEN 'Evening'
+        ELSE 'Late Night'
+      END AS hour_band,
+      encode(digest(concat_ws('|', incident_text, source_file_year), 'sha256'), 'hex') AS incident_nk,
+      encode(digest(concat_ws('|', coalesce(trim(street_no_text), ''), coalesce(trim(street_name_text), ''), coalesce(trim(street_type_text), ''), coalesce(trim(street_suffix_text), ''), coalesce(trim(city_text), ''), coalesce(trim(zip_code_text), ''), coalesce(trim(longitude_text), ''), coalesce(trim(latitude_text), '')), 'sha256'), 'hex') AS location_nk,
+      encode(digest(concat_ws('|', incident_text, occurrence_date_text, occurrence_hour_text, nibrs_class_text, nibrs_desc_text, offense_count_text, beat_text, premise_text, street_no_text, street_name_text, street_type_text, street_suffix_text, city_text, zip_code_text, longitude_text, latitude_text, source_file_year), 'sha256'), 'hex') AS row_hash
+    FROM raw_crime.nibrs_{yr};
+  ")
+  DBI::dbExecute(con, sql)
+}
+```
+
+## Dimension Tables
+
+The Divvy example builds dimensions before loading the central fact table, including lookups and a date dimension. The same principle is applied here, but with crime-specific dimensions required for executive reporting and spatiotemporal analysis. fileciteturn1file2turn1file3
+
+```{sql dimensions, connection=con}
+DROP TABLE IF EXISTS mart_crime.fact_crime_offense CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_zipcode CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_city CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_beat CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_premise CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_location CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_offense CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_time CASCADE;
+DROP TABLE IF EXISTS mart_crime.dim_date CASCADE;
+
+CREATE TABLE mart_crime.dim_date (
+  date_key        INTEGER PRIMARY KEY,
+  full_date       DATE UNIQUE,
+  year_num        INTEGER,
+  quarter_num     INTEGER,
+  month_num       INTEGER,
+  month_name      TEXT,
+  week_num        INTEGER,
+  day_num         INTEGER,
+  day_of_week_num INTEGER,
+  day_name        TEXT,
+  is_weekend      BOOLEAN
+);
+
+CREATE TABLE mart_crime.dim_time (
+  time_key        SMALLINT PRIMARY KEY,
+  hour_24         SMALLINT UNIQUE,
+  hour_label      TEXT,
+  hour_band       TEXT
+);
+
+CREATE TABLE mart_crime.dim_offense (
+  offense_key        BIGSERIAL PRIMARY KEY,
+  nibrs_class        TEXT,
+  nibrs_description  TEXT,
+  crime_group        TEXT,
+  severity_tier      TEXT,
+  is_violent         BOOLEAN,
+  is_property        BOOLEAN,
+  is_drug_related    BOOLEAN,
+  is_vehicle_related BOOLEAN,
+  UNIQUE(nibrs_class, nibrs_description)
+);
+
+CREATE TABLE mart_crime.dim_location (
+  location_key       BIGSERIAL PRIMARY KEY,
+  location_nk        TEXT UNIQUE,
+  street_number      TEXT,
+  street_name        TEXT,
+  street_type        TEXT,
+  street_suffix      TEXT,
+  full_address       TEXT,
+  map_longitude      DOUBLE PRECISION,
+  map_latitude       DOUBLE PRECISION,
+  geo_valid_flag     BOOLEAN,
+  geocode_precision  TEXT
+);
+
+CREATE TABLE mart_crime.dim_premise (
+  premise_key        BIGSERIAL PRIMARY KEY,
+  premise_desc       TEXT UNIQUE,
+  premise_group      TEXT
+);
+
+CREATE TABLE mart_crime.dim_beat (
+  beat_key           BIGSERIAL PRIMARY KEY,
+  beat_code          TEXT UNIQUE,
+  patrol_division    TEXT
+);
+
+CREATE TABLE mart_crime.dim_city (
+  city_key           BIGSERIAL PRIMARY KEY,
+  city_name          TEXT UNIQUE
+);
+
+CREATE TABLE mart_crime.dim_zipcode (
+  zipcode_key        BIGSERIAL PRIMARY KEY,
+  zip_code           TEXT UNIQUE
+);
+```
+
+## Populate Dimensions
+
+```{sql populate-dimensions, connection=con}
+INSERT INTO mart_crime.dim_date (
+  date_key, full_date, year_num, quarter_num, month_num, month_name,
+  week_num, day_num, day_of_week_num, day_name, is_weekend
+)
+SELECT
+  TO_CHAR(d::date, 'YYYYMMDD')::INT AS date_key,
+  d::date,
+  EXTRACT(YEAR FROM d)::INT,
+  EXTRACT(QUARTER FROM d)::INT,
+  EXTRACT(MONTH FROM d)::INT,
+  TO_CHAR(d::date, 'Month'),
+  EXTRACT(WEEK FROM d)::INT,
+  EXTRACT(DAY FROM d)::INT,
+  EXTRACT(DOW FROM d)::INT,
+  trim(TO_CHAR(d::date, 'Day')),
+  (EXTRACT(DOW FROM d) IN (0,6))
+FROM generate_series('2020-01-01'::date, '2026-12-31'::date, interval '1 day') AS s(d);
+
+INSERT INTO mart_crime.dim_time(time_key, hour_24, hour_label, hour_band)
+SELECT
+  h::smallint,
+  h::smallint,
+  lpad(h::text, 2, '0') || ':00',
+  CASE
+    WHEN h BETWEEN 0 AND 5 THEN 'Overnight'
+    WHEN h BETWEEN 6 AND 11 THEN 'Morning'
+    WHEN h BETWEEN 12 AND 17 THEN 'Afternoon'
+    WHEN h BETWEEN 18 AND 21 THEN 'Evening'
+    ELSE 'Late Night'
+  END
+FROM generate_series(0,23) AS g(h);
+
+INSERT INTO mart_crime.dim_offense (
+  nibrs_class, nibrs_description, crime_group, severity_tier,
+  is_violent, is_property, is_drug_related, is_vehicle_related
+)
+SELECT DISTINCT
+  nibrs_class,
+  nibrs_description,
+  CASE
+    WHEN nibrs_class IN ('09A','09B','09C','09D','11A','11B','11C','120','13A','13B','13C') THEN 'Violent Crime'
+    WHEN nibrs_class LIKE '23%' OR nibrs_class LIKE '24%' OR nibrs_class = '220' OR nibrs_class LIKE '26%' OR nibrs_class = '280' THEN 'Property Crime'
+    WHEN nibrs_class IN ('35A','35B','35C','35D') THEN 'Drug Crime'
+    WHEN nibrs_class LIKE '240' OR nibrs_description ILIKE '%motor vehicle%' THEN 'Vehicle Crime'
+    ELSE 'Other Crime'
+  END AS crime_group,
+  CASE
+    WHEN nibrs_class IN ('09A','11A','13A','120') THEN 'High'
+    WHEN nibrs_class IN ('09B','09C','11B','13B','220','240') THEN 'Medium'
+    ELSE 'Standard'
+  END AS severity_tier,
+  nibrs_class IN ('09A','09B','09C','09D','11A','11B','11C','120','13A','13B','13C') AS is_violent,
+  (nibrs_class LIKE '23%' OR nibrs_class LIKE '24%' OR nibrs_class = '220' OR nibrs_class LIKE '26%' OR nibrs_class = '280') AS is_property,
+  nibrs_class IN ('35A','35B','35C','35D') AS is_drug_related,
+  (nibrs_class LIKE '240' OR nibrs_description ILIKE '%motor vehicle%') AS is_vehicle_related
+FROM stg_crime.stg_nibrs_offense;
+
+INSERT INTO mart_crime.dim_location (
+  location_nk, street_number, street_name, street_type, street_suffix,
+  full_address, map_longitude, map_latitude, geo_valid_flag, geocode_precision
+)
+SELECT DISTINCT
+  location_nk,
+  street_number,
+  street_name,
+  street_type,
+  street_suffix,
+  full_address,
+  map_longitude,
+  map_latitude,
+  (map_longitude BETWEEN -180 AND 180 AND map_latitude BETWEEN -90 AND 90) AS geo_valid_flag,
+  CASE
+    WHEN map_longitude IS NOT NULL AND map_latitude IS NOT NULL THEN 'Address+Coordinate'
+    WHEN full_address IS NOT NULL THEN 'AddressOnly'
+    ELSE 'Unknown'
+  END AS geocode_precision
+FROM stg_crime.stg_nibrs_offense;
+
+INSERT INTO mart_crime.dim_premise(premise_desc, premise_group)
+SELECT DISTINCT
+  premise_desc,
+  CASE
+    WHEN premise_desc ILIKE '%Residence%' OR premise_desc ILIKE '%Apartment%' THEN 'Residential'
+    WHEN premise_desc ILIKE '%Road%' OR premise_desc ILIKE '%Street%' OR premise_desc ILIKE '%Highway%' OR premise_desc ILIKE '%Alley%' THEN 'Roadway / Outdoor'
+    WHEN premise_desc ILIKE '%Parking%' OR premise_desc ILIKE '%Garage%' OR premise_desc ILIKE '%Transit%' THEN 'Parking / Transit'
+    WHEN premise_desc ILIKE '%Restaurant%' OR premise_desc ILIKE '%Hotel%' OR premise_desc ILIKE '%Bar%' THEN 'Hospitality'
+    WHEN premise_desc ILIKE '%Store%' OR premise_desc ILIKE '%Shop%' OR premise_desc ILIKE '%Gas%' OR premise_desc ILIKE '%Commercial%' THEN 'Commercial / Retail'
+    ELSE 'Other / Unknown'
+  END AS premise_group
+FROM stg_crime.stg_nibrs_offense;
+
+INSERT INTO mart_crime.dim_beat(beat_code, patrol_division)
+SELECT DISTINCT
+  beat_code,
+  left(beat_code, 1) AS patrol_division
+FROM stg_crime.stg_nibrs_offense
+WHERE beat_code IS NOT NULL;
+
+INSERT INTO mart_crime.dim_city(city_name)
+SELECT DISTINCT city_name
+FROM stg_crime.stg_nibrs_offense
+WHERE city_name IS NOT NULL;
+
+INSERT INTO mart_crime.dim_zipcode(zip_code)
+SELECT DISTINCT zip_code
+FROM stg_crime.stg_nibrs_offense
+WHERE zip_code IS NOT NULL;
+```
+
+## Fact Table
+
+The Divvy example defines a single central fact table after its dimensions are ready. The same pattern is used here, with a reporting grain of one row per incident-offense observation, preserving incident detail while allowing additive offense metrics for executive reporting. fileciteturn1file3
+
+```{sql fact-table, connection=con}
+CREATE TABLE mart_crime.fact_crime_offense (
+  fact_crime_key      BIGSERIAL PRIMARY KEY,
+  incident_id         BIGINT NOT NULL,
+  date_key            INTEGER REFERENCES mart_crime.dim_date(date_key),
+  time_key            SMALLINT REFERENCES mart_crime.dim_time(time_key),
+  offense_key         BIGINT REFERENCES mart_crime.dim_offense(offense_key),
+  location_key        BIGINT REFERENCES mart_crime.dim_location(location_key),
+  premise_key         BIGINT REFERENCES mart_crime.dim_premise(premise_key),
+  beat_key            BIGINT REFERENCES mart_crime.dim_beat(beat_key),
+  city_key            BIGINT REFERENCES mart_crime.dim_city(city_key),
+  zipcode_key         BIGINT REFERENCES mart_crime.dim_zipcode(zipcode_key),
+  source_year         INTEGER,
+  source_file_name    TEXT,
+  offense_count       INTEGER NOT NULL,
+  incident_count      INTEGER NOT NULL DEFAULT 1,
+  violent_crime_flag  BOOLEAN,
+  property_crime_flag BOOLEAN,
+  drug_crime_flag     BOOLEAN,
+  vehicle_crime_flag  BOOLEAN,
+  geo_valid_flag      BOOLEAN,
+  load_ts             TIMESTAMP DEFAULT now(),
+  uq_row UNIQUE (incident_id, date_key, time_key, offense_key, location_key, premise_key, beat_key)
+);
+```
+
+## Helper Mapping Tables
+
+This follows the same idea as the Divvy helper mapping pattern: snapshot compact dimension keys into temporary maps so the fact load can translate business fields into surrogate keys with efficient joins. fileciteturn1file3
+
+```{sql helper-maps, connection=con}
+CREATE TEMP TABLE tmp_offense_map AS
+SELECT offense_key, nibrs_class, nibrs_description
+FROM mart_crime.dim_offense;
+
+CREATE TEMP TABLE tmp_location_map AS
+SELECT location_key, location_nk
+FROM mart_crime.dim_location;
+
+CREATE TEMP TABLE tmp_premise_map AS
+SELECT premise_key, premise_desc
+FROM mart_crime.dim_premise;
+
+CREATE TEMP TABLE tmp_beat_map AS
+SELECT beat_key, beat_code
+FROM mart_crime.dim_beat;
+
+CREATE TEMP TABLE tmp_city_map AS
+SELECT city_key, city_name
+FROM mart_crime.dim_city;
+
+CREATE TEMP TABLE tmp_zip_map AS
+SELECT zipcode_key, zip_code
+FROM mart_crime.dim_zipcode;
+```
+
+## Load the Fact Table
+
+```{sql load-fact, connection=con}
+INSERT INTO mart_crime.fact_crime_offense (
+  incident_id, date_key, time_key, offense_key, location_key, premise_key,
+  beat_key, city_key, zipcode_key, source_year, source_file_name,
+  offense_count, incident_count,
+  violent_crime_flag, property_crime_flag, drug_crime_flag, vehicle_crime_flag, geo_valid_flag
+)
+SELECT
+  s.incident_id,
+  TO_CHAR(s.occurrence_date, 'YYYYMMDD')::INT AS date_key,
+  s.occurrence_hour AS time_key,
+  o.offense_key,
+  l.location_key,
+  p.premise_key,
+  b.beat_key,
+  c.city_key,
+  z.zipcode_key,
+  s.source_year,
+  s.source_file_name,
+  s.offense_count,
+  1 AS incident_count,
+  o.is_violent,
+  o.is_property,
+  o.is_drug_related,
+  o.is_vehicle_related,
+  l.geo_valid_flag
+FROM stg_crime.stg_nibrs_offense s
+LEFT JOIN tmp_offense_map  o ON s.nibrs_class = o.nibrs_class AND coalesce(s.nibrs_description, '') = coalesce(o.nibrs_description, '')
+LEFT JOIN tmp_location_map l ON s.location_nk = l.location_nk
+LEFT JOIN tmp_premise_map  p ON s.premise_desc = p.premise_desc
+LEFT JOIN tmp_beat_map     b ON s.beat_code = b.beat_code
+LEFT JOIN tmp_city_map     c ON s.city_name = c.city_name
+LEFT JOIN tmp_zip_map      z ON s.zip_code = z.zip_code
+WHERE s.incident_id IS NOT NULL
+  AND s.occurrence_date IS NOT NULL
+  AND s.occurrence_hour BETWEEN 0 AND 23
+ON CONFLICT ON CONSTRAINT uq_row DO NOTHING;
+```
+
+## Indexes
+
+The Divvy example adds targeted indexes to accelerate date, segment, location, and route analysis. The same philosophy applies here, but optimized for public safety workloads centered on time, geography, offense type, and premise. fileciteturn1file4
+
+```{sql indexes, connection=con}
+CREATE INDEX IF NOT EXISTS idx_fact_crime_date         ON mart_crime.fact_crime_offense(date_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_time         ON mart_crime.fact_crime_offense(time_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_offense      ON mart_crime.fact_crime_offense(offense_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_location     ON mart_crime.fact_crime_offense(location_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_premise      ON mart_crime.fact_crime_offense(premise_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_beat         ON mart_crime.fact_crime_offense(beat_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_city         ON mart_crime.fact_crime_offense(city_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_zip          ON mart_crime.fact_crime_offense(zipcode_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_year_date    ON mart_crime.fact_crime_offense(source_year, date_key);
+CREATE INDEX IF NOT EXISTS idx_fact_crime_offense_beat ON mart_crime.fact_crime_offense(offense_key, beat_key, date_key);
+CREATE INDEX IF NOT EXISTS idx_stage_incident          ON stg_crime.stg_nibrs_offense(incident_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stage_row_hash   ON stg_crime.stg_nibrs_offense(row_hash);
+```
+
+## Reporting Views
+
+The Divvy document creates enriched views and summary views for repeated analytical queries. Here, the same pattern is used to expose a reporting-friendly crime mart for Power BI and SQL EDA. fileciteturn1file4
+
+```{sql views, connection=con}
+CREATE OR REPLACE VIEW mart_crime.vw_crime_enriched AS
+SELECT
+  f.fact_crime_key,
+  f.incident_id,
+  d.full_date,
+  d.year_num,
+  d.quarter_num,
+  d.month_num,
+  d.month_name,
+  d.week_num,
+  d.day_num,
+  d.day_of_week_num,
+  d.day_name,
+  d.is_weekend,
+  t.hour_24,
+  t.hour_label,
+  t.hour_band,
+  o.nibrs_class,
+  o.nibrs_description,
+  o.crime_group,
+  o.severity_tier,
+  p.premise_desc,
+  p.premise_group,
+  b.beat_code,
+  c.city_name,
+  z.zip_code,
+  l.full_address,
+  l.map_longitude,
+  l.map_latitude,
+  f.offense_count,
+  f.incident_count,
+  f.violent_crime_flag,
+  f.property_crime_flag,
+  f.drug_crime_flag,
+  f.vehicle_crime_flag,
+  f.geo_valid_flag,
+  f.source_year,
+  f.source_file_name
+FROM mart_crime.fact_crime_offense f
+JOIN mart_crime.dim_date d ON f.date_key = d.date_key
+JOIN mart_crime.dim_time t ON f.time_key = t.time_key
+LEFT JOIN mart_crime.dim_offense o ON f.offense_key = o.offense_key
+LEFT JOIN mart_crime.dim_location l ON f.location_key = l.location_key
+LEFT JOIN mart_crime.dim_premise p ON f.premise_key = p.premise_key
+LEFT JOIN mart_crime.dim_beat b ON f.beat_key = b.beat_key
+LEFT JOIN mart_crime.dim_city c ON f.city_key = c.city_key
+LEFT JOIN mart_crime.dim_zipcode z ON f.zipcode_key = z.zipcode_key;
+
+CREATE OR REPLACE VIEW mart_crime.vw_daily_crime_counts AS
+SELECT
+  full_date,
+  crime_group,
+  COUNT(DISTINCT incident_id) AS incidents,
+  SUM(offense_count) AS offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY full_date, crime_group;
+
+CREATE OR REPLACE VIEW mart_crime.vw_beat_monthly_summary AS
+SELECT
+  year_num,
+  month_num,
+  beat_code,
+  crime_group,
+  COUNT(DISTINCT incident_id) AS incidents,
+  SUM(offense_count) AS offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY year_num, month_num, beat_code, crime_group;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mart_crime.mv_executive_monthly_summary AS
+SELECT
+  year_num,
+  month_num,
+  crime_group,
+  premise_group,
+  COUNT(DISTINCT incident_id) AS incidents,
+  SUM(offense_count) AS offenses,
+  SUM(CASE WHEN violent_crime_flag THEN offense_count ELSE 0 END) AS violent_offenses,
+  SUM(CASE WHEN property_crime_flag THEN offense_count ELSE 0 END) AS property_offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY year_num, month_num, crime_group, premise_group;
+
+REFRESH MATERIALIZED VIEW mart_crime.mv_executive_monthly_summary;
+```
+
+## Helper Functions
+
+```{sql helper-functions, connection=con}
+CREATE OR REPLACE FUNCTION mart_crime.norm_text(txt TEXT)
+RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+SELECT NULLIF(regexp_replace(lower(trim(txt)), '\s+', ' ', 'g'), '');
+$$;
+
+CREATE OR REPLACE FUNCTION mart_crime.location_label(addr TEXT, city TEXT, zip TEXT)
+RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+SELECT concat_ws(', ', NULLIF(trim(addr), ''), NULLIF(trim(city), ''), NULLIF(trim(zip), ''));
+$$;
+```
+
+# Exploratory Data Analysis (SQL)
+
+## Monthly Crime Trend by Group
+
+```{sql sql-monthly-trend, connection=con}
+SELECT year_num, month_num, crime_group,
+       COUNT(DISTINCT incident_id) AS incidents,
+       SUM(offense_count) AS offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY year_num, month_num, crime_group
+ORDER BY year_num, month_num, crime_group;
+```
+
+## Peak Hour by Offense Group
+
+```{sql sql-peak-hour, connection=con}
+SELECT hour_24, crime_group,
+       COUNT(DISTINCT incident_id) AS incidents
+FROM mart_crime.vw_crime_enriched
+GROUP BY hour_24, crime_group
+ORDER BY hour_24, incidents DESC;
+```
+
+## Top Beats by Total Incidents
+
+```{sql sql-top-beats, connection=con}
+SELECT beat_code,
+       COUNT(DISTINCT incident_id) AS incidents,
+       SUM(offense_count) AS offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY beat_code
+ORDER BY incidents DESC
+LIMIT 20;
+```
+
+## Top Premises by Crime Volume
+
+```{sql sql-top-premises, connection=con}
+SELECT premise_group, premise_desc,
+       COUNT(DISTINCT incident_id) AS incidents,
+       SUM(offense_count) AS offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY premise_group, premise_desc
+ORDER BY incidents DESC
+LIMIT 20;
+```
+
+## Spatial Hotspots by ZIP Code
+
+```{sql sql-hotspots-zip, connection=con}
+SELECT zip_code,
+       COUNT(DISTINCT incident_id) AS incidents,
+       SUM(offense_count) AS offenses
+FROM mart_crime.vw_crime_enriched
+GROUP BY zip_code
+ORDER BY incidents DESC
+LIMIT 20;
+```
+
+# Data Quality & Maintenance
+
+## Missing Critical Fields
+
+```{sql qa-missing, connection=con}
+SELECT
+  SUM((incident_id IS NULL)::INT) AS missing_incident_id,
+  SUM((occurrence_date IS NULL)::INT) AS missing_occurrence_date,
+  SUM((occurrence_hour IS NULL)::INT) AS missing_occurrence_hour,
+  SUM((nibrs_class IS NULL)::INT) AS missing_nibrs_class,
+  SUM((beat_code IS NULL)::INT) AS missing_beat_code
+FROM stg_crime.stg_nibrs_offense;
+```
+
+## Duplicate Staging Rows
+
+```{sql qa-duplicates, connection=con}
+SELECT row_hash, COUNT(*)
+FROM stg_crime.stg_nibrs_offense
+GROUP BY row_hash
+HAVING COUNT(*) > 1
+ORDER BY COUNT(*) DESC;
+```
+
+## Invalid Geographic Coordinates
+
+```{sql qa-geo, connection=con}
+SELECT COUNT(*) AS invalid_geo_rows
+FROM stg_crime.stg_nibrs_offense
+WHERE map_longitude IS NOT NULL
+  AND map_latitude IS NOT NULL
+  AND NOT (map_longitude BETWEEN -180 AND 180 AND map_latitude BETWEEN -90 AND 90);
+```
+
+## Refresh Cadence
+
+When new crime files arrive, the refresh cycle should follow the same disciplined pattern documented in the Divvy example: land new source data, update dimensions and facts, and refresh summary objects for downstream analytics. fileciteturn1file4
+
+```{sql refresh-cadence, connection=con}
+REFRESH MATERIALIZED VIEW mart_crime.mv_executive_monthly_summary;
+```
+
+# Conclusion
+
+This project converts the yearly NIBRS public files into a layered PostgreSQL reporting warehouse with raw landing tables, a standardized staging table, conformed dimensions, and a central crime fact table. The resulting design supports executive dashboarding, hotspot analysis, temporal trend analysis, and downstream machine learning feature generation. It also mirrors the proven documentation structure of the uploaded Divvy database example—environment setup, ingestion, dimensional modeling, indexing, reusable views, data quality checks, and refresh operations—while expanding it into a more production-level crime analytics design. fileciteturn1file4

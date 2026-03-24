@@ -1,9 +1,9 @@
 ---
 title: |
   \vspace*{\fill}
-  \fontsize{34}{38}\selectfont \textbf {Crime Reporting Analytics Database}
+  \fontsize{40}{44}\selectfont \textbf {Crime Reporting Analytics Database}
 author: |
-  \fontsize{24}{28}\selectfont Seif H. Kungulio
+  \fontsize{34}{38}\selectfont Seif H. Kungulio
 date: |
   \fontsize{18}{22}\selectfont March 23, 2026
   \ \vspace*{\fill}
@@ -51,3 +51,15 @@ editor_options:
 \pagenumbering{arabic}
 
 # Introduction
+
+
+
+\newpage
+
+# Database Creation
+
+
+
+\newpage
+
+# Conclusion
